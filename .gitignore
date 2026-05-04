@@ -1,8 +1,21 @@
+# Environment
 .env
+.venv/
+
+# Python
 __pycache__/
 *.pyc
+
+# Editors
 .vscode/
 .antigravity/
 .DS_Store
+
+# Data (don't commit the dataset or zip)
 data/*.csv
+data/*.zip
+data/bank-additional/
+data/__MACOSX/
+
+# MLflow
 mlflow.db
