@@ -16,12 +16,13 @@ from contracts.v1 import (
     ErrorResponse,
 )
 from .dependencies import get_http_client, get_settings_dep
+from .drift import DriftDetector
 
 log = structlog.get_logger()
 
 
 # ------------------------------------------------------------------
-# Model manager – keeps pipeline + threshold + metadata together
+# ModelManager
 # ------------------------------------------------------------------
 class ModelManager:
     def __init__(self, pipeline, threshold, feature_names, version: str):
@@ -35,66 +36,85 @@ class ModelManager:
 # Dependency injection helpers
 # ------------------------------------------------------------------
 async def get_model_manager(request: Request) -> ModelManager:
-    """Dependency that yields the loaded ModelManager."""
     return request.app.state.model_manager
 
 
+async def get_drift_detector(request: Request) -> DriftDetector:
+    return request.app.state.drift_detector
+
+
 # ------------------------------------------------------------------
-# App lifespan – load the model once
+# Helper: safe fire‑and‑forget webhook sender
+# ------------------------------------------------------------------
+async def _send_webhook_safe(client: httpx.AsyncClient, url: str, payload: dict) -> None:
+    """Send drift webhook, log failures but never raise."""
+    try:
+        resp = await client.post(url, json=payload)
+        log.info("webhook_sent", status_code=resp.status_code)
+    except httpx.ConnectError:
+        log.warning("webhook_failed", url=url, reason="Agent unreachable")
+    except Exception:
+        log.exception("webhook_unexpected_error", url=url)
+
+
+# ------------------------------------------------------------------
+# App lifespan
 # ------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings_dep()
     model_path = Path("models/model.pkl")
 
-    # Load the artifact dict and wrap it in a manager
+    # Load model
     try:
         artifact = await asyncio.to_thread(joblib.load, model_path)
         app.state.model_manager = ModelManager(
             pipeline=artifact["pipeline"],
             threshold=artifact["threshold"],
             feature_names=artifact["feature_names"],
-            version="1",   # later you'll pull this from MLflow
+            version="1",
         )
-        log.info(
-            "platform.startup.model_loaded",
-            version=app.state.model_manager.version,
-            threshold=app.state.model_manager.threshold,
-        )
+        log.info("model_loaded", threshold=app.state.model_manager.threshold)
     except Exception:
-        log.exception("platform.startup.model_load_failed")
+        log.exception("model_load_failed")
         raise RuntimeError("Could not load model") from None
 
-    # Shared HTTP client for webhook calls
+    # Drift detector (change _last_severity initialisation to "low" in drift.py!)
+    app.state.drift_detector = DriftDetector(
+        reference_path=Path("models/reference.json"),
+        window_path=Path("data/prediction_window.csv"),
+        window_size=500,
+        min_window_size=100,
+    )
+    log.info("drift_detector_initialised")
+
+    # HTTP client for webhooks
     app.state.http_client = httpx.AsyncClient(timeout=10.0)
-    log.info("platform.startup", mlflow_uri=settings.mlflow_tracking_uri)
+    log.info("platform_startup")
 
     yield
 
     await app.state.http_client.aclose()
-    log.info("platform.shutdown")
+    log.info("platform_shutdown")
 
 
 app = FastAPI(lifespan=lifespan)
 
 
-# ------------------------------------------------------------------
-# Health endpoint
-# ------------------------------------------------------------------
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
 
-# ------------------------------------------------------------------
-# Prediction endpoint – fully typed, fully async, fully DI
-# ------------------------------------------------------------------
 @app.post("/predict", response_model=PredictResponse)
 async def predict(
     body: PredictRequest,
+    request: Request,
     model: ModelManager = Depends(get_model_manager),
+    drift_detector: DriftDetector = Depends(get_drift_detector),
+    settings = Depends(get_settings_dep),
 ):
-    """Accept a raw feature vector and return a prediction."""
+    """Make a prediction and check for drift."""
     if len(body.features) != len(model.feature_names):
         raise HTTPException(
             status_code=422,
@@ -104,10 +124,22 @@ async def predict(
     # Build DataFrame with correct column names
     X = pd.DataFrame([body.features], columns=model.feature_names)
 
-    # CPU‑bound inference in thread
+    # CPU‑bound inference
     proba = await asyncio.to_thread(model.pipeline.predict_proba, X)
     positive_proba = float(proba[0, 1])
     pred = int(positive_proba >= model.threshold)
+
+    # Drift check
+    features_dict = dict(zip(model.feature_names, body.features))
+    drift_report = drift_detector.check_and_report(features_dict, positive_proba)
+
+    if drift_report is not None:
+        agent_url = settings.agent_webhook_url
+        log.info("drift_severity_changed", severity=drift_report["severity"], agent_url=agent_url)
+        # Safe fire‑and‑forget – never crash the platform
+        asyncio.create_task(
+            _send_webhook_safe(request.app.state.http_client, agent_url, drift_report)
+        )
 
     log.info("prediction", prediction=pred, probability=positive_proba, model_version=model.version)
 
@@ -118,13 +150,9 @@ async def predict(
     )
 
 
-# ------------------------------------------------------------------
-# Promotion endpoint – placeholder (will implement later)
-# ------------------------------------------------------------------
 @app.post("/promote", response_model=PromoteResponse)
 async def promote(
     body: PromoteRequest,
     settings = Depends(get_settings_dep),
 ):
-    # Will verify authorization header and MLflow promotion checklist
     raise HTTPException(status_code=501, detail="Promotion logic not implemented yet")

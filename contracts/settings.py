@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     # Promotion secret
     promotion_api_key: str
 
+    # Agent webhook URL (where drift alerts go)
+    agent_webhook_url: str = "http://127.0.0.1:8001/webhook"    
+
     # MLflow
     mlflow_tracking_uri: str = "sqlite:///mlflow.db"
 
