@@ -98,13 +98,13 @@ preprocessor = ColumnTransformer(
 # 4.  Define candidate classifiers
 # ----------------------------------------------------------------------
 classifiers = {
-    "LogisticRegression": LogisticRegression(max_iter=1000, random_state=42),
+    "LogisticRegression": LogisticRegression(max_iter=1000, random_state=42 , class_weight='balanced'),
     "RandomForest": RandomForestClassifier(
-        n_estimators=100, max_depth=10, random_state=42, n_jobs=-1
+        n_estimators=100, max_depth=10, random_state=42, n_jobs=-1 ,
+        class_weight='balanced'
     ),
     "GradientBoosting": GradientBoostingClassifier(
-        n_estimators=100, max_depth=3, random_state=42
-    ),
+        n_estimators=100, max_depth=3, random_state=42 ),
 }
 
 # ----------------------------------------------------------------------
@@ -226,6 +226,64 @@ joblib.dump(model_artifact, MODEL_DIR / "model.pkl")
 print(f"\nModel saved to {MODEL_DIR / 'model.pkl'}")
 
 # ----------------------------------------------------------------------
+# 13. Compute and save reference distributions for drift detection
+# ----------------------------------------------------------------------
+print("\nComputing reference distributions for drift detection...")
+
+# Numeric features – bin edges using 10 equal-frequency bins from train set
+numeric_ref = {}
+for col in numeric_cols:
+    train_col = X_train[col].astype(float)
+    # Create 10 bins based on quantiles
+    bin_edges = np.quantile(train_col, q=np.linspace(0, 1, 11))
+    # Ensure unique edges (some features may have many identical values)
+    bin_edges = np.unique(bin_edges)
+    if len(bin_edges) < 3:
+        # fallback: use linear bins if quantiles collapse
+        bin_edges = np.linspace(train_col.min(), train_col.max(), 11)
+    # Compute reference proportions for these bins on train set
+    counts, _ = np.histogram(train_col, bins=bin_edges)
+    ref_proportions = counts / counts.sum()
+    numeric_ref[col] = {
+        "bin_edges": bin_edges.tolist(),
+        "ref_proportions": ref_proportions.tolist()
+    }
+
+# Categorical features – frequency of each category
+categorical_ref = {}
+for col in categorical_cols:
+    train_col = X_train[col].astype(str)
+    counts = train_col.value_counts()
+    # Keep all categories seen in training; any new category later gets tiny frequency
+    total = counts.sum()
+    ref_proportions = (counts / total).to_dict()
+    categorical_ref[col] = {
+        "categories": list(ref_proportions.keys()),
+        "ref_proportions": ref_proportions
+    }
+
+# Output (predicted probability) distribution on training set
+train_proba_ref = best_pipeline.predict_proba(X_train)[:, 1]
+output_bin_edges = np.linspace(0, 1, 11)
+output_counts, _ = np.histogram(train_proba_ref, bins=output_bin_edges)
+output_ref_proportions = output_counts / output_counts.sum()
+output_ref = {
+    "bin_edges": output_bin_edges.tolist(),
+    "ref_proportions": output_ref_proportions.tolist()
+}
+
+reference = {
+    "numeric": numeric_ref,
+    "categorical": categorical_ref,
+    "output": output_ref
+}
+
+REF_PATH = MODEL_DIR / "reference.json"
+with open(REF_PATH, "w") as f:
+    json.dump(reference, f, indent=2)
+print(f"Reference distributions saved to {REF_PATH}")
+
+# ----------------------------------------------------------------------
 # 10.  Helper to plot confusion matrix (pure matplotlib – no seaborn)
 # ----------------------------------------------------------------------
 def plot_confusion_matrix(cm, title):
@@ -301,6 +359,17 @@ with mlflow.start_run():
 
     # Log confusion matrix artifact
     mlflow.log_artifact(cm_test_img)
+    mlflow.sklearn.log_model(
+        sk_model=best_pipeline,
+        artifact_path="sklearn_model",
+        registered_model_name="bank_marketing_classifier",
+        input_example=input_example,
+        signature=signature,
+    )
+    # --- NEW: store threshold & feature names as tags ---
+    mlflow.set_tag("threshold", OPERATING_THRESHOLD)
+    mlflow.set_tag("feature_names", json.dumps(X.columns.tolist()))
+    mlflow.set_tag("model_name", best_model_name)
 
     # Log the model
     mlflow.pyfunc.log_model(

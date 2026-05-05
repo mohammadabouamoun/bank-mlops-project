@@ -16,12 +16,13 @@ from contracts.v1 import (
     ErrorResponse,
 )
 from .dependencies import get_http_client, get_settings_dep
+from .drift import DriftDetector
 
 log = structlog.get_logger()
 
 
 # ------------------------------------------------------------------
-# Model manager – keeps pipeline + threshold + metadata together
+# ModelManager
 # ------------------------------------------------------------------
 class ModelManager:
     def __init__(self, pipeline, threshold, feature_names, version: str):
@@ -35,66 +36,85 @@ class ModelManager:
 # Dependency injection helpers
 # ------------------------------------------------------------------
 async def get_model_manager(request: Request) -> ModelManager:
-    """Dependency that yields the loaded ModelManager."""
     return request.app.state.model_manager
 
 
+async def get_drift_detector(request: Request) -> DriftDetector:
+    return request.app.state.drift_detector
+
+
 # ------------------------------------------------------------------
-# App lifespan – load the model once
+# Helper: safe fire‑and‑forget webhook sender
+# ------------------------------------------------------------------
+async def _send_webhook_safe(client: httpx.AsyncClient, url: str, payload: dict) -> None:
+    """Send drift webhook, log failures but never raise."""
+    try:
+        resp = await client.post(url, json=payload)
+        log.info("webhook_sent", status_code=resp.status_code)
+    except httpx.ConnectError:
+        log.warning("webhook_failed", url=url, reason="Agent unreachable")
+    except Exception:
+        log.exception("webhook_unexpected_error", url=url)
+
+
+# ------------------------------------------------------------------
+# App lifespan
 # ------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings_dep()
     model_path = Path("models/model.pkl")
 
-    # Load the artifact dict and wrap it in a manager
+    # Load model
     try:
         artifact = await asyncio.to_thread(joblib.load, model_path)
         app.state.model_manager = ModelManager(
             pipeline=artifact["pipeline"],
             threshold=artifact["threshold"],
             feature_names=artifact["feature_names"],
-            version="1",   # later you'll pull this from MLflow
+            version="1",
         )
-        log.info(
-            "platform.startup.model_loaded",
-            version=app.state.model_manager.version,
-            threshold=app.state.model_manager.threshold,
-        )
+        log.info("model_loaded", threshold=app.state.model_manager.threshold)
     except Exception:
-        log.exception("platform.startup.model_load_failed")
+        log.exception("model_load_failed")
         raise RuntimeError("Could not load model") from None
 
-    # Shared HTTP client for webhook calls
+    # Drift detector (change _last_severity initialisation to "low" in drift.py!)
+    app.state.drift_detector = DriftDetector(
+        reference_path=Path("models/reference.json"),
+        window_path=Path("data/prediction_window.csv"),
+        window_size=500,
+        min_window_size=100,
+    )
+    log.info("drift_detector_initialised")
+
+    # HTTP client for webhooks
     app.state.http_client = httpx.AsyncClient(timeout=10.0)
-    log.info("platform.startup", mlflow_uri=settings.mlflow_tracking_uri)
+    log.info("platform_startup")
 
     yield
 
     await app.state.http_client.aclose()
-    log.info("platform.shutdown")
+    log.info("platform_shutdown")
 
 
 app = FastAPI(lifespan=lifespan)
 
 
-# ------------------------------------------------------------------
-# Health endpoint
-# ------------------------------------------------------------------
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
 
-# ------------------------------------------------------------------
-# Prediction endpoint – fully typed, fully async, fully DI
-# ------------------------------------------------------------------
 @app.post("/predict", response_model=PredictResponse)
 async def predict(
     body: PredictRequest,
+    request: Request,
     model: ModelManager = Depends(get_model_manager),
+    drift_detector: DriftDetector = Depends(get_drift_detector),
+    settings = Depends(get_settings_dep),
 ):
-    """Accept a raw feature vector and return a prediction."""
+    """Make a prediction and check for drift."""
     if len(body.features) != len(model.feature_names):
         raise HTTPException(
             status_code=422,
@@ -104,10 +124,22 @@ async def predict(
     # Build DataFrame with correct column names
     X = pd.DataFrame([body.features], columns=model.feature_names)
 
-    # CPU‑bound inference in thread
+    # CPU‑bound inference
     proba = await asyncio.to_thread(model.pipeline.predict_proba, X)
     positive_proba = float(proba[0, 1])
     pred = int(positive_proba >= model.threshold)
+
+    # Drift check
+    features_dict = dict(zip(model.feature_names, body.features))
+    drift_report = drift_detector.check_and_report(features_dict, positive_proba)
+
+    if drift_report is not None:
+        agent_url = settings.agent_webhook_url
+        log.info("drift_severity_changed", severity=drift_report["severity"], agent_url=agent_url)
+        # Safe fire‑and‑forget – never crash the platform
+        asyncio.create_task(
+            _send_webhook_safe(request.app.state.http_client, agent_url, drift_report)
+        )
 
     log.info("prediction", prediction=pred, probability=positive_proba, model_version=model.version)
 
@@ -118,13 +150,115 @@ async def predict(
     )
 
 
-# ------------------------------------------------------------------
-# Promotion endpoint – placeholder (will implement later)
-# ------------------------------------------------------------------
 @app.post("/promote", response_model=PromoteResponse)
 async def promote(
     body: PromoteRequest,
+    request: Request,
     settings = Depends(get_settings_dep),
 ):
-    # Will verify authorization header and MLflow promotion checklist
-    raise HTTPException(status_code=501, detail="Promotion logic not implemented yet")
+    """
+    Programmatic promotion gate.
+    1. Verify Authorization header.
+    2. Fetch the requested model version and its run metrics/tags.
+    3. Absolute checks: recall >= 0.75, AUC >= 0.70, threshold tag present.
+    4. (Optional) Regression check: compare against current Production model.
+    5. Transition the new version to Production in MLflow.
+    """
+    # ---------- Auth ----------
+    auth_header = request.headers.get("Authorization", "")
+    expected_key = f"Bearer {settings.promotion_api_key}"
+    if auth_header != expected_key:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # ---------- Fetch model version from MLflow ----------
+    import mlflow
+    from mlflow.tracking import MlflowClient
+    import json
+
+    mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
+    client = MlflowClient()
+
+    try:
+        mv = client.get_model_version("bank_marketing_classifier", body.model_version)
+    except Exception:
+        raise HTTPException(status_code=404, detail=f"Model version {body.model_version} not found")
+
+    run_id = mv.run_id
+    if not run_id:
+        raise HTTPException(status_code=400, detail="Model version has no run attached")
+
+    # ---------- Retrieve stored metrics & tags from the run ----------
+    run = client.get_run(run_id)
+    metrics = run.data.metrics
+    tags = run.data.tags
+
+    model_recall = metrics.get("test_recall")
+    model_auc = metrics.get("test_auc")
+    stored_threshold = float(tags.get("threshold", 0)) if tags.get("threshold") else None
+
+    if model_recall is None or model_auc is None or stored_threshold is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Promotion checklist failed: missing required metrics or threshold tag in model run",
+        )
+
+    # ---------- Absolute Day‑4 checklist ----------
+    if model_recall < settings.promotion_min_recall:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Recall {model_recall:.4f} below required {settings.promotion_min_recall}",
+        )
+    if model_auc < settings.promotion_min_auc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"AUC {model_auc:.4f} below required {settings.promotion_min_auc}",
+        )
+
+    # ---------- Optional: Regression check against current Production ----------
+    prod_versions = client.get_latest_versions(
+        "bank_marketing_classifier", stages=["Production"]
+    )
+    if prod_versions:
+        prod_mv = prod_versions[0]
+        prod_run = client.get_run(prod_mv.run_id)
+        prod_metrics = prod_run.data.metrics
+        prod_recall = prod_metrics.get("test_recall")
+        prod_auc = prod_metrics.get("test_auc")
+
+        if prod_recall is not None and model_recall < prod_recall:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Recall {model_recall:.4f} is worse than current Production ({prod_recall:.4f})",
+            )
+        if prod_auc is not None and model_auc < prod_auc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"AUC {model_auc:.4f} is worse than current Production ({prod_auc:.4f})",
+            )
+
+    # ---------- Transition to Production ----------
+    try:
+        # Archive any existing Production version
+        for existing in client.get_latest_versions(
+            "bank_marketing_classifier", stages=["Production"]
+        ):
+            client.transition_model_version_stage(
+                name="bank_marketing_classifier",
+                version=existing.version,
+                stage="Archived",
+            )
+        # Promote the requested version
+        client.transition_model_version_stage(
+            name="bank_marketing_classifier",
+            version=body.model_version,
+            stage="Production",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"MLflow stage transition failed: {str(e)}")
+
+    log.info("model_promoted", version=body.model_version, investigation_id=body.investigation_id)
+
+    return PromoteResponse(
+        message=f"Model version {body.model_version} promoted to Production",
+        new_production_version=body.model_version,
+    )
