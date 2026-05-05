@@ -153,6 +153,112 @@ async def predict(
 @app.post("/promote", response_model=PromoteResponse)
 async def promote(
     body: PromoteRequest,
+    request: Request,
     settings = Depends(get_settings_dep),
 ):
-    raise HTTPException(status_code=501, detail="Promotion logic not implemented yet")
+    """
+    Programmatic promotion gate.
+    1. Verify Authorization header.
+    2. Fetch the requested model version and its run metrics/tags.
+    3. Absolute checks: recall >= 0.75, AUC >= 0.70, threshold tag present.
+    4. (Optional) Regression check: compare against current Production model.
+    5. Transition the new version to Production in MLflow.
+    """
+    # ---------- Auth ----------
+    auth_header = request.headers.get("Authorization", "")
+    expected_key = f"Bearer {settings.promotion_api_key}"
+    if auth_header != expected_key:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # ---------- Fetch model version from MLflow ----------
+    import mlflow
+    from mlflow.tracking import MlflowClient
+    import json
+
+    mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
+    client = MlflowClient()
+
+    try:
+        mv = client.get_model_version("bank_marketing_classifier", body.model_version)
+    except Exception:
+        raise HTTPException(status_code=404, detail=f"Model version {body.model_version} not found")
+
+    run_id = mv.run_id
+    if not run_id:
+        raise HTTPException(status_code=400, detail="Model version has no run attached")
+
+    # ---------- Retrieve stored metrics & tags from the run ----------
+    run = client.get_run(run_id)
+    metrics = run.data.metrics
+    tags = run.data.tags
+
+    model_recall = metrics.get("test_recall")
+    model_auc = metrics.get("test_auc")
+    stored_threshold = float(tags.get("threshold", 0)) if tags.get("threshold") else None
+
+    if model_recall is None or model_auc is None or stored_threshold is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Promotion checklist failed: missing required metrics or threshold tag in model run",
+        )
+
+    # ---------- Absolute Day‑4 checklist ----------
+    if model_recall < settings.promotion_min_recall:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Recall {model_recall:.4f} below required {settings.promotion_min_recall}",
+        )
+    if model_auc < settings.promotion_min_auc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"AUC {model_auc:.4f} below required {settings.promotion_min_auc}",
+        )
+
+    # ---------- Optional: Regression check against current Production ----------
+    prod_versions = client.get_latest_versions(
+        "bank_marketing_classifier", stages=["Production"]
+    )
+    if prod_versions:
+        prod_mv = prod_versions[0]
+        prod_run = client.get_run(prod_mv.run_id)
+        prod_metrics = prod_run.data.metrics
+        prod_recall = prod_metrics.get("test_recall")
+        prod_auc = prod_metrics.get("test_auc")
+
+        if prod_recall is not None and model_recall < prod_recall:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Recall {model_recall:.4f} is worse than current Production ({prod_recall:.4f})",
+            )
+        if prod_auc is not None and model_auc < prod_auc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"AUC {model_auc:.4f} is worse than current Production ({prod_auc:.4f})",
+            )
+
+    # ---------- Transition to Production ----------
+    try:
+        # Archive any existing Production version
+        for existing in client.get_latest_versions(
+            "bank_marketing_classifier", stages=["Production"]
+        ):
+            client.transition_model_version_stage(
+                name="bank_marketing_classifier",
+                version=existing.version,
+                stage="Archived",
+            )
+        # Promote the requested version
+        client.transition_model_version_stage(
+            name="bank_marketing_classifier",
+            version=body.model_version,
+            stage="Production",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"MLflow stage transition failed: {str(e)}")
+
+    log.info("model_promoted", version=body.model_version, investigation_id=body.investigation_id)
+
+    return PromoteResponse(
+        message=f"Model version {body.model_version} promoted to Production",
+        new_production_version=body.model_version,
+    )

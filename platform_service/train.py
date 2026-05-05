@@ -359,6 +359,17 @@ with mlflow.start_run():
 
     # Log confusion matrix artifact
     mlflow.log_artifact(cm_test_img)
+    mlflow.sklearn.log_model(
+        sk_model=best_pipeline,
+        artifact_path="sklearn_model",
+        registered_model_name="bank_marketing_classifier",
+        input_example=input_example,
+        signature=signature,
+    )
+    # --- NEW: store threshold & feature names as tags ---
+    mlflow.set_tag("threshold", OPERATING_THRESHOLD)
+    mlflow.set_tag("feature_names", json.dumps(X.columns.tolist()))
+    mlflow.set_tag("model_name", best_model_name)
 
     # Log the model
     mlflow.pyfunc.log_model(
