@@ -19,3 +19,10 @@ data/__MACOSX/
 
 # MLflow
 mlflow.db
+mlruns/
+
+# Generated artifacts from training
+cm.png
+environment.json
+model_card.md
+schema.json

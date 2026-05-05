@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict ,Union
 from enum import Enum
 
 
@@ -10,8 +10,9 @@ class Severity(str, Enum):
 
 
 class PredictRequest(BaseModel):
-    features: List[float] = Field(..., description="Preprocessed feature vector for one sample")
-
+    features: List[Union[float, str]] = Field(
+        ..., description="Raw feature values (numbers and strings) for one sample"
+    )
 
 class PredictResponse(BaseModel):
     prediction: int
