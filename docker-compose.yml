@@ -25,6 +25,7 @@ services:
     volumes:
       # Persist rolling window predictions and MLflow DB across restarts
       - platform_data:/app/data
+      - ./mlflow.db:/app/mlflow.db
     networks:
       - bank-net
 

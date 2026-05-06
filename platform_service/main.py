@@ -238,24 +238,14 @@ async def promote(
 
     # ---------- Transition to Production ----------
     try:
-        # Archive any existing Production version
-        for existing in client.get_latest_versions(
-            "bank_marketing_classifier", stages=["Production"]
-        ):
-            client.transition_model_version_stage(
-                name="bank_marketing_classifier",
-                version=existing.version,
-                stage="Archived",
-            )
-        # Promote the requested version
         client.transition_model_version_stage(
             name="bank_marketing_classifier",
             version=body.model_version,
             stage="Production",
+            archive_existing_versions=True,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"MLflow stage transition failed: {str(e)}")
-
     log.info("model_promoted", version=body.model_version, investigation_id=body.investigation_id)
 
     return PromoteResponse(
