@@ -27,5 +27,10 @@ jobs:
           pip install ruff
           ruff check platform_service/ contracts/
 
+      - name: Create dummy .env for tests
+        run: |
+          echo 'LLM_API_KEY=sk-dummy' > .env
+          echo 'PROMOTION_API_KEY=dev-secret-123' >> .env
+
       - name: Run tests
         run: pytest tests/
