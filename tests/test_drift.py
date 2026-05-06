@@ -1,10 +1,7 @@
 # tests/test_drift.py
 import json
 import numpy as np
-import pandas as pd
-from pathlib import Path
 import pytest
-from unittest.mock import patch
 from platform_service.drift import DriftDetector, _psi, _chi2_pvalue
 
 # -------------------------------------------------------------------

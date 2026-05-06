@@ -1,5 +1,4 @@
 # tests/test_main.py
-import json
 
 def test_health(client):
     resp = client.get("/health")

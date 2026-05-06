@@ -4,7 +4,6 @@ import httpx
 import structlog
 import asyncio
 import joblib
-import numpy as np
 import pandas as pd
 from pathlib import Path
 
@@ -13,9 +12,8 @@ from contracts.v1 import (
     PredictResponse,
     PromoteRequest,
     PromoteResponse,
-    ErrorResponse,
 )
-from .dependencies import get_http_client, get_settings_dep
+from .dependencies import get_settings_dep
 from .drift import DriftDetector
 
 log = structlog.get_logger()
@@ -198,7 +196,6 @@ async def promote(
     # ---------- Fetch model version from MLflow ----------
     import mlflow
     from mlflow.tracking import MlflowClient
-    import json
 
     mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
     client = MlflowClient()

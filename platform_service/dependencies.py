@@ -1,4 +1,4 @@
-from fastapi import Depends, Request
+from fastapi import Request
 from .config import settings
 
 def get_model(request: Request):
