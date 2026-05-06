@@ -1,0 +1,31 @@
+name: platform-tests
+
+on:
+  push:
+    branches: [ main, feat/* ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r platform_service/requirements.txt
+          pip install pytest pytest-mock httpx
+
+      - name: Lint with ruff
+        run: |
+          pip install ruff
+          ruff check platform_service/ contracts/
+
+      - name: Run tests
+        run: pytest tests/
