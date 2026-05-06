@@ -1,0 +1,86 @@
+version: "3.9"
+
+services:
+  # ---- Platform (Person A) ----
+  platform:
+    build:
+      context: .
+      dockerfile: platform_service/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      # LLM settings (unused by platform, but required by Settings class)
+      LLM_API_KEY: ${LLM_API_KEY}
+      LLM_PROVIDER: ${LLM_PROVIDER:-groq}
+      LLM_MODEL: ${LLM_MODEL:-llama-3.3-70b-versatile}
+      # Promotion secret
+      PROMOTION_API_KEY: ${PROMOTION_API_KEY}
+      # Agent webhook URL (where drift alerts go)
+      AGENT_WEBHOOK_URL: ${AGENT_WEBHOOK_URL:-http://agent:8000/webhook}
+      # MLflow tracking (SQLite inside container)
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-sqlite:///app/mlflow.db}
+      # Promotion checklist thresholds
+      PROMOTION_MIN_RECALL: ${PROMOTION_MIN_RECALL:-0.75}
+      PROMOTION_MIN_AUC: ${PROMOTION_MIN_AUC:-0.70}
+    volumes:
+      # Persist rolling window predictions and MLflow DB across restarts
+      - platform_data:/app/data
+      - ./mlflow.db:/app/mlflow.db
+    networks:
+      - bank-net
+
+  # ---- Agent (Person B) ----
+  agent:
+    build: ./agent
+    ports:
+      - "8001:8000"
+    environment:
+      LLM_API_KEY: ${LLM_API_KEY}
+      LLM_PROVIDER: ${LLM_PROVIDER:-groq}
+      LLM_MODEL: ${LLM_MODEL:-llama-3.3-70b-versatile}
+      PROMOTION_API_KEY: ${PROMOTION_API_KEY}
+      PLATFORM_PROMOTE_URL: ${PLATFORM_PROMOTE_URL:-http://platform:8000/promote}
+      POSTGRES_USER: ${POSTGRES_USER:-agent}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-agentpass}
+      POSTGRES_DB: ${POSTGRES_DB:-agentdb}
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-redispass}
+    depends_on:
+      - postgres
+      - redis
+      - platform
+    networks:
+      - bank-net
+    profiles:
+      - agent   # won't start unless explicitly requested
+
+  # ---- Postgres (for agent checkpoints) ----
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-agent}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-agentpass}
+      POSTGRES_DB: ${POSTGRES_DB:-agentdb}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - bank-net
+
+  # ---- Redis (for agent queue) ----
+  redis:
+    image: redis:7-alpine
+    command: redis-server --requirepass ${REDIS_PASSWORD:-redispass}
+    volumes:
+      - redis_data:/data
+    networks:
+      - bank-net
+
+volumes:
+  platform_data:
+  postgres_data:
+  redis_data:
+
+networks:
+  bank-net:
+    driver: bridge

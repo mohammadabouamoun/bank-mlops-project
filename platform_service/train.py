@@ -1,5 +1,4 @@
 import sys
-import os
 from pathlib import Path
 from datetime import datetime, timezone
 import json
@@ -34,7 +33,7 @@ from sklearn.metrics import (
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from contracts.settings import get_settings
+from contracts.settings import get_settings  # noqa: E402
 
 # ----------------------------------------------------------------------
 # 1.  Load and preprocess
@@ -178,7 +177,7 @@ test_f1 = f1_score(y_test, test_pred)
 test_recall = recall_score(y_test, test_pred)
 test_precision = precision_score(y_test, test_pred)
 
-print(f"\nTest metrics:")
+print("\nTest metrics:")
 print(f"  AUC:       {test_auc:.4f}")
 print(f"  F1:        {test_f1:.4f}")
 print(f"  Recall:    {test_recall:.4f}")
@@ -201,7 +200,7 @@ print("Confusion Matrix (Test):\n", cm_test)
 train_auc = roc_auc_score(y_train, train_proba)
 val_auc = best_auc
 
-print(f"\nOverfitting check (AUC):")
+print("\nOverfitting check (AUC):")
 print(f"  Train AUC:  {train_auc:.4f}")
 print(f"  Val AUC:    {val_auc:.4f}")
 print(f"  Test AUC:   {test_auc:.4f}")
@@ -289,7 +288,7 @@ print(f"Reference distributions saved to {REF_PATH}")
 def plot_confusion_matrix(cm, title):
     """Save a confusion matrix as a PNG using matplotlib."""
     fig, ax = plt.subplots(figsize=(4, 3))
-    im = ax.imshow(cm, interpolation='nearest', cmap='Blues')
+    ax.imshow(cm, interpolation='nearest', cmap='Blues')
     ax.set_title(title)
     ax.set_xlabel('Predicted')
     ax.set_ylabel('Actual')
