@@ -1,3 +1,6 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import streamlit as st
 import requests
 import mlflow
@@ -5,7 +8,6 @@ from mlflow.tracking import MlflowClient
 from contracts.settings import get_settings
 
 settings = get_settings()
-
 st.set_page_config(page_title="Bank MLOps Dashboard", layout="wide")
 st.title("Drift Triage Co‑Pilot – Dashboard")
 
@@ -48,8 +50,22 @@ except Exception as e:
 # Drift Status (placeholder)
 # ------------------------------------------------------------------
 st.header("Drift Status")
-st.info("Drift monitoring data will be displayed here once the agent is integrated.")
-
+try:
+    drift_resp = requests.get("http://127.0.0.1:8000/drift/latest", timeout=5)
+    if drift_resp.status_code == 200:
+        drift = drift_resp.json()
+        severity = drift.get("severity", "low").upper()
+        color = {"LOW": "green", "MEDIUM": "orange", "HIGH": "red"}.get(severity, "blue")
+        st.markdown(f"**Severity:** :{color}[{severity}]")
+        st.write(f"Window size: {drift.get('window_size', 0)}")
+        with st.expander("PSI (numeric)"):
+            st.json(drift.get("psi_values", {}))
+        with st.expander("Chi² p-values (categorical)"):
+            st.json(drift.get("chi2_values", {}))
+    else:
+        st.warning("Could not fetch drift report")
+except Exception as e:
+    st.error(f"Drift endpoint error: {e}")
 # ------------------------------------------------------------------
 # Agent Investigations (placeholder – partner will implement)
 # ------------------------------------------------------------------
@@ -61,3 +77,4 @@ st.info("Investigation list coming soon – partner's agent module required.")
 # ------------------------------------------------------------------
 st.header("Queue & HIL")
 st.info("Queue depth and Human‑in‑the‑Loop approvals will appear here.")
+

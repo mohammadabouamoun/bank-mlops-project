@@ -167,6 +167,13 @@ async def predict(
         model_version=model.version,
     )
 
+@app.get("/drift/latest")
+async def get_latest_drift(
+    request: Request,
+    detector: DriftDetector = Depends(get_drift_detector),
+):
+    report = detector.compute_drift_report()
+    return report
 
 @app.post("/promote", response_model=PromoteResponse)
 async def promote(
