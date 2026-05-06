@@ -1,0 +1,12 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+.env
+.vscode
+.antigravity
+mlruns
+*.md
+*.png
+requirements-dev.txt

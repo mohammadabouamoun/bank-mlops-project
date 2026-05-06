@@ -4,7 +4,6 @@ import httpx
 import structlog
 import asyncio
 import joblib
-import numpy as np
 import pandas as pd
 from pathlib import Path
 
@@ -13,9 +12,8 @@ from contracts.v1 import (
     PredictResponse,
     PromoteRequest,
     PromoteResponse,
-    ErrorResponse,
 )
-from .dependencies import get_http_client, get_settings_dep
+from .dependencies import get_settings_dep
 from .drift import DriftDetector
 
 log = structlog.get_logger()
@@ -65,13 +63,14 @@ async def lifespan(app: FastAPI):
     settings = get_settings_dep()
     model_path = Path("models/model.pkl")
 
-    # Load model
+    # ---- Load the pipeline + threshold + feature names from disk ----
     try:
         artifact = await asyncio.to_thread(joblib.load, model_path)
         app.state.model_manager = ModelManager(
             pipeline=artifact["pipeline"],
             threshold=artifact["threshold"],
             feature_names=artifact["feature_names"],
+            # Temporary version – will be overwritten below
             version="1",
         )
         log.info("model_loaded", threshold=app.state.model_manager.threshold)
@@ -79,7 +78,27 @@ async def lifespan(app: FastAPI):
         log.exception("model_load_failed")
         raise RuntimeError("Could not load model") from None
 
-    # Drift detector (change _last_severity initialisation to "low" in drift.py!)
+    # ---- Query MLflow for the current Production version number ----
+    try:
+        import mlflow
+        from mlflow.tracking import MlflowClient
+        mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
+        client = MlflowClient()
+        prod_versions = client.get_latest_versions(
+            "bank_marketing_classifier", stages=["Production"]
+        )
+        if prod_versions:
+            prod_version = str(prod_versions[0].version)   # ensure it's a string
+            app.state.model_manager.version = prod_version
+            log.info("production_version_resolved", version=prod_version)
+        else:
+            log.warning("no_production_version_found", default_version="1")
+            app.state.model_manager.version = "1"   # fallback
+    except Exception:
+        log.exception("mlflow_version_lookup_failed")
+        # Keep the default version – the server will still work
+
+    # ---- Drift detector & HTTP client (unchanged) ----
     app.state.drift_detector = DriftDetector(
         reference_path=Path("models/reference.json"),
         window_path=Path("data/prediction_window.csv"),
@@ -88,7 +107,6 @@ async def lifespan(app: FastAPI):
     )
     log.info("drift_detector_initialised")
 
-    # HTTP client for webhooks
     app.state.http_client = httpx.AsyncClient(timeout=10.0)
     log.info("platform_startup")
 
@@ -96,8 +114,6 @@ async def lifespan(app: FastAPI):
 
     await app.state.http_client.aclose()
     log.info("platform_shutdown")
-
-
 app = FastAPI(lifespan=lifespan)
 
 
@@ -149,6 +165,13 @@ async def predict(
         model_version=model.version,
     )
 
+@app.get("/drift/latest")
+async def get_latest_drift(
+    request: Request,
+    detector: DriftDetector = Depends(get_drift_detector),
+):
+    report = detector.compute_drift_report()
+    return report
 
 @app.post("/promote", response_model=PromoteResponse)
 async def promote(
@@ -173,7 +196,6 @@ async def promote(
     # ---------- Fetch model version from MLflow ----------
     import mlflow
     from mlflow.tracking import MlflowClient
-    import json
 
     mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
     client = MlflowClient()
@@ -238,24 +260,14 @@ async def promote(
 
     # ---------- Transition to Production ----------
     try:
-        # Archive any existing Production version
-        for existing in client.get_latest_versions(
-            "bank_marketing_classifier", stages=["Production"]
-        ):
-            client.transition_model_version_stage(
-                name="bank_marketing_classifier",
-                version=existing.version,
-                stage="Archived",
-            )
-        # Promote the requested version
         client.transition_model_version_stage(
             name="bank_marketing_classifier",
             version=body.model_version,
             stage="Production",
+            archive_existing_versions=True,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"MLflow stage transition failed: {str(e)}")
-
     log.info("model_promoted", version=body.model_version, investigation_id=body.investigation_id)
 
     return PromoteResponse(
