@@ -65,13 +65,14 @@ async def lifespan(app: FastAPI):
     settings = get_settings_dep()
     model_path = Path("models/model.pkl")
 
-    # Load model
+    # ---- Load the pipeline + threshold + feature names from disk ----
     try:
         artifact = await asyncio.to_thread(joblib.load, model_path)
         app.state.model_manager = ModelManager(
             pipeline=artifact["pipeline"],
             threshold=artifact["threshold"],
             feature_names=artifact["feature_names"],
+            # Temporary version – will be overwritten below
             version="1",
         )
         log.info("model_loaded", threshold=app.state.model_manager.threshold)
@@ -79,7 +80,27 @@ async def lifespan(app: FastAPI):
         log.exception("model_load_failed")
         raise RuntimeError("Could not load model") from None
 
-    # Drift detector (change _last_severity initialisation to "low" in drift.py!)
+    # ---- Query MLflow for the current Production version number ----
+    try:
+        import mlflow
+        from mlflow.tracking import MlflowClient
+        mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
+        client = MlflowClient()
+        prod_versions = client.get_latest_versions(
+            "bank_marketing_classifier", stages=["Production"]
+        )
+        if prod_versions:
+            prod_version = str(prod_versions[0].version)   # ensure it's a string
+            app.state.model_manager.version = prod_version
+            log.info("production_version_resolved", version=prod_version)
+        else:
+            log.warning("no_production_version_found", default_version="1")
+            app.state.model_manager.version = "1"   # fallback
+    except Exception:
+        log.exception("mlflow_version_lookup_failed")
+        # Keep the default version – the server will still work
+
+    # ---- Drift detector & HTTP client (unchanged) ----
     app.state.drift_detector = DriftDetector(
         reference_path=Path("models/reference.json"),
         window_path=Path("data/prediction_window.csv"),
@@ -88,7 +109,6 @@ async def lifespan(app: FastAPI):
     )
     log.info("drift_detector_initialised")
 
-    # HTTP client for webhooks
     app.state.http_client = httpx.AsyncClient(timeout=10.0)
     log.info("platform_startup")
 
@@ -96,8 +116,6 @@ async def lifespan(app: FastAPI):
 
     await app.state.http_client.aclose()
     log.info("platform_shutdown")
-
-
 app = FastAPI(lifespan=lifespan)
 
 

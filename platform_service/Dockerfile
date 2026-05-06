@@ -2,21 +2,25 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# System dependencies for scikit-learn
+# Install system dependencies (scikit-learn needs gcc)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc g++ && \
+    gcc g++ curl && \
     rm -rf /var/lib/apt/lists/*
 
-# Copy and install dependencies (requirements.txt lives in platform_service/)
-COPY platform_service/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Install uv (fast Python package installer)
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
 
-# Copy all code needed at runtime: contracts, platform_service, models
+# Copy and install Python dependencies using uv
+COPY platform_service/requirements.txt .
+RUN uv pip install --system --no-cache -r requirements.txt
+
+# Copy application code and models
 COPY contracts/ contracts/
 COPY platform_service/ platform_service/
 COPY models/ models/
 
-# Rolling window persistence directory (will be mounted as volume)
+# Rolling window persistence directory
 RUN mkdir -p /app/data
 
 EXPOSE 8000
