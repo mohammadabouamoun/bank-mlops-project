@@ -1,0 +1,2 @@
+You are a communication agent.
+Summarize the investigation outcome for the dashboard.

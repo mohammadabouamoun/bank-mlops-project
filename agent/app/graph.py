@@ -1,4 +1,13 @@
 from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.postgres import PostgresSaver
+from psycopg import connect
+
+
+DB_URI = "postgresql://agent:agentpass@localhost:5432/agentdb"
+
+conn = connect(DB_URI)
+
+checkpointer = PostgresSaver(conn)
 
 
 class AgentState(dict):
@@ -6,30 +15,57 @@ class AgentState(dict):
 
 
 def triage_node(state):
-    state["triage"] = "action_needed"
+    severity = state.get("severity", "low")
+
+    if severity == "high":
+        state["triage"] = "action_needed"
+    elif severity == "medium":
+        state["triage"] = "monitor"
+    else:
+        state["triage"] = "ignore"
+
     return state
 
 
 def action_node(state):
-    state["action"] = "retrain_model"
+    triage = state.get("triage")
+
+    if triage == "action_needed":
+        state["action"] = "retrain_model"
+        state["requires_approval"] = True
+
+    elif triage == "monitor":
+        state["action"] = "log_only"
+        state["requires_approval"] = False
+
+    else:
+        state["action"] = "do_nothing"
+        state["requires_approval"] = False
+
     return state
 
 
 def comms_node(state):
-    state["message"] = "Retrain required"
+    state["message"] = (
+        f"Triage: {state['triage']} | "
+        f"Action: {state['action']}"
+    )
+
     return state
 
 
-builder = StateGraph(AgentState)
+workflow = StateGraph(AgentState)
 
-builder.add_node("triage", triage_node)
-builder.add_node("action", action_node)
-builder.add_node("comms", comms_node)
+workflow.add_node("triage", triage_node)
+workflow.add_node("action", action_node)
+workflow.add_node("comms", comms_node)
 
-builder.set_entry_point("triage")
+workflow.set_entry_point("triage")
 
-builder.add_edge("triage", "action")
-builder.add_edge("action", "comms")
-builder.add_edge("comms", END)
+workflow.add_edge("triage", "action")
+workflow.add_edge("action", "comms")
+workflow.add_edge("comms", END)
 
-graph = builder.compile()
+graph = workflow.compile(
+    checkpointer=checkpointer
+)
